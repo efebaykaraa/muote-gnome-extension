@@ -1,11 +1,2 @@
-/target
-pkg/
-src/
-*.pkg.tar*
-*.src.tar.gz
 dist/
-aur/*/*.tar.gz
-aur/src/
-aur/pkg/
-gnome-ui-guidelines.txt
 *.zip

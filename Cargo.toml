@@ -1,8 +1,0 @@
-[workspace]
-members = [
-    "core",
-    "gui",
-    "quote-fetch",
-    "position-containers"
-]
-resolver = "2"
