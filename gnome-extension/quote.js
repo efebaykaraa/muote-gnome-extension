@@ -1,5 +1,6 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Soup from 'gi://Soup?version=3.0';
 
 function readText(path) {
     try {
@@ -74,34 +75,56 @@ function poolPath(configDir, author) {
     return GLib.build_filenamev([configDir, 'pools', `${key}.json`]);
 }
 
-function fetcherPath() {
-    const path = GLib.find_program_in_path('wikiquote-fetcher');
-    if (!path) {
-        throw new Error(
-            'Wikiquote Fetcher is not installed. Install it with: yay -S wikiquote-fetcher');
-    }
-    return path;
+function apiUrl(base, parameters) {
+    const query = Object.entries(parameters)
+        .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+        .join('&');
+    return `${base}?${query}`;
 }
 
-function runFetcher(args) {
-    const process = Gio.Subprocess.new(
-        [fetcherPath(), ...args],
-        Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
-    return new Promise((resolve, reject) => {
-        process.communicate_utf8_async(null, null, (source, result) => {
-            try {
-                const [, stdout, stderr] = source.communicate_utf8_finish(result);
-                if (!source.get_successful()) {
-                    reject(new Error((stderr || stdout ||
-                        'Wikiquote Fetcher failed').trim()));
-                    return;
-                }
-                resolve((stdout ?? '').trim());
-            } catch (error) {
-                reject(error);
-            }
-        });
-    });
+function decodeHtmlEntities(text) {
+    const named = {
+        amp: '&', apos: "'", gt: '>', hellip: '…', laquo: '«', ldquo: '“',
+        lsquo: '‘', lt: '<', mdash: '—', nbsp: ' ', ndash: '–', quot: '"',
+        raquo: '»', rdquo: '”', rsquo: '’',
+    };
+    return text
+        .replace(/&#x([0-9a-f]+);/gi, (_match, value) =>
+            String.fromCodePoint(Number.parseInt(value, 16)))
+        .replace(/&#(\d+);/g, (_match, value) =>
+            String.fromCodePoint(Number.parseInt(value, 10)))
+        .replace(/&([a-z]+);/gi, (match, name) => named[name.toLowerCase()] ?? match);
+}
+
+function cleanHtmlText(html) {
+    return decodeHtmlEntities(html
+        .replace(/<(sup|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+        .replace(/<br\s*\/?>/gi, ' ')
+        .replace(/<[^>]+>/g, ' '))
+        .replace(/\s+/g, ' ')
+        .trim()
+        .replace(/^["“”«»]+|["“”«»]+$/g, '')
+        .trim();
+}
+
+function isAttribution(text) {
+    const lower = text.toLowerCase();
+    return [
+        'as quoted in', 'letter from', 'letter to', 'quoted in', 'source:',
+        'variant:', 'see also', 'compare:', 'attributed', 'paraphrase',
+        'often misquoted', 'sometimes attributed', 'this is often',
+    ].some(prefix => lower.startsWith(prefix));
+}
+
+function extractQuotesFromHtml(html) {
+    const quotes = [];
+    for (const match of html.matchAll(/<li\b[^>]*>([\s\S]*?)<\/li>/gi)) {
+        const quote = cleanHtmlText(match[1].replace(
+            /<(ul|dl)\b[^>]*>[\s\S]*?<\/\1>/gi, ' '));
+        if ([...quote].length >= 20 && !isAttribution(quote))
+            quotes.push(quote);
+    }
+    return [...new Set(quotes)];
 }
 
 function fetchCandidates(enabledAuthors, configDir, current, maxChars) {
@@ -118,75 +141,145 @@ function fetchCandidates(enabledAuthors, configDir, current, maxChars) {
     }).filter(author => author.quotes.length);
 }
 
-export async function skipQuote() {
-    const configDir = GLib.build_filenamev([GLib.get_user_config_dir(), 'muote']);
-    const cachePath = GLib.build_filenamev([
-        GLib.get_user_cache_dir(), 'muote', 'current_quote.txt',
-    ]);
-    const authors = readJson(GLib.build_filenamev([configDir, 'authors.json']), {
-        authors: [],
-        quote_mode: 'fetch',
-    });
-    const settings = readJson(GLib.build_filenamev([configDir, 'settings.json']), {
-        appearance: {max_quote_chars: 581},
-    });
-    const maxChars = Math.max(1, Number(settings.appearance?.max_quote_chars) || 581);
-    const current = parseCurrent(readText(cachePath));
+export class QuoteService {
+    constructor() {
+        this._session = new Soup.Session({
+            user_agent: 'Muote GNOME extension ' +
+                '(https://github.com/efebaykaraa/muote-gnome-extension)',
+        });
+    }
 
-    let chosen = null;
-    if (authors.quote_mode === 'custom') {
-        let quotes = parseCustomQuotes(
-            GLib.build_filenamev([configDir, 'custom-quotes.muote']))
-            .filter(quote => quote.weight > 0 && [...quote.quote].length <= maxChars);
-        const alternatives = quotes.filter(quote =>
-            quote.quote !== current.quote || quote.author !== current.author);
-        if (alternatives.length)
-            quotes = alternatives;
-        chosen = weightedChoice(quotes);
-    } else {
-        const enabledAuthors = (authors.authors ?? []).filter(author =>
-            String(author.name ?? '').trim() && Number(author.weight) > 0);
-        if (!enabledAuthors.length)
-            throw new Error('No enabled authors are configured');
-        let candidates = fetchCandidates(
-            enabledAuthors, configDir, current, maxChars);
-        if (!candidates.length) {
-            const author = weightedChoice(enabledAuthors);
-            await runFetcher([
-                'pool', '--dir', GLib.build_filenamev([configDir, 'pools']),
-                'fetch', author.name,
-            ]);
-            candidates = fetchCandidates(
+    destroy() {
+        this._session?.abort();
+        this._session = null;
+    }
+
+    _requestJson(url) {
+        if (!this._session)
+            return Promise.reject(new Error('Muote network service is not available'));
+
+        const session = this._session;
+        const message = Soup.Message.new('GET', url);
+        return new Promise((resolve, reject) => {
+            session.send_and_read_async(
+                message, GLib.PRIORITY_DEFAULT, null, (source, result) => {
+                try {
+                    const bytes = source.send_and_read_finish(result);
+                    const contents = new TextDecoder().decode(bytes.get_data());
+                    if (message.status_code < 200 || message.status_code >= 300) {
+                        reject(new Error(
+                            `Request failed (${message.status_code}): ` +
+                            contents.slice(0, 160)));
+                        return;
+                    }
+                    resolve(JSON.parse(contents));
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        });
+    }
+
+    async fetchWikiquote(author) {
+        const endpoint = 'https://en.wikiquote.org/w/api.php';
+        const data = await this._requestJson(apiUrl(endpoint, {
+            action: 'parse', page: author, format: 'json', prop: 'text', origin: '*',
+        }));
+        const html = data.parse?.text?.['*'];
+        if (typeof html !== 'string')
+            throw new Error(`Wikiquote has no readable page for ${author}`);
+        return extractQuotesFromHtml(html).slice(0, 200);
+    }
+
+    async translateQuote(quote, targetLanguage) {
+        const language = String(targetLanguage).trim().toLowerCase().replaceAll('_', '-');
+        if (language === 'original' || language === 'auto')
+            return quote;
+        const data = await this._requestJson(apiUrl(
+            'https://translate.googleapis.com/translate_a/single', {
+                client: 'gtx', sl: 'auto', tl: language, dt: 't', q: quote,
+            }));
+        const translated = Array.isArray(data?.[0])
+            ? data[0].map(sentence => sentence?.[0] ?? '').join('').trim()
+            : '';
+        if (!translated)
+            throw new Error('Google Translate returned no translated text');
+        return translated;
+    }
+
+    async skipQuote() {
+        const configDir = GLib.build_filenamev([GLib.get_user_config_dir(), 'muote']);
+        const cachePath = GLib.build_filenamev([
+            GLib.get_user_cache_dir(), 'muote', 'current_quote.txt',
+        ]);
+        const authors = readJson(GLib.build_filenamev([configDir, 'authors.json']), {
+            authors: [],
+            quote_mode: 'fetch',
+        });
+        const settings = readJson(GLib.build_filenamev([configDir, 'settings.json']), {
+            appearance: {max_quote_chars: 581},
+        });
+        const maxChars = Math.max(
+            1, Number(settings.appearance?.max_quote_chars) || 581);
+        const current = parseCurrent(readText(cachePath));
+
+        let chosen = null;
+        if (authors.quote_mode === 'custom') {
+            let quotes = parseCustomQuotes(
+                GLib.build_filenamev([configDir, 'custom-quotes.muote']))
+                .filter(quote => quote.weight > 0 &&
+                    [...quote.quote].length <= maxChars);
+            const alternatives = quotes.filter(quote =>
+                quote.quote !== current.quote || quote.author !== current.author);
+            if (alternatives.length)
+                quotes = alternatives;
+            chosen = weightedChoice(quotes);
+        } else {
+            const enabledAuthors = (authors.authors ?? []).filter(author =>
+                String(author.name ?? '').trim() && Number(author.weight) > 0);
+            if (!enabledAuthors.length)
+                throw new Error('No enabled authors are configured');
+            let candidates = fetchCandidates(
                 enabledAuthors, configDir, current, maxChars);
+            if (!candidates.length) {
+                const author = weightedChoice(enabledAuthors);
+                const quotes = await this.fetchWikiquote(author.name);
+                writeText(poolPath(configDir, author.name), JSON.stringify({
+                    key: author.name,
+                    quotes,
+                }, null, 2));
+                candidates = fetchCandidates(
+                    enabledAuthors, configDir, current, maxChars);
+            }
+            const selectedAuthor = weightedChoice(candidates);
+            if (!selectedAuthor)
+                throw new Error('Wikiquote did not return a usable quote');
+
+            const index = Math.floor(Math.random() * selectedAuthor.quotes.length);
+            chosen = {
+                quote: selectedAuthor.quotes[index],
+                author: selectedAuthor.name,
+            };
+            chosen.poolQuote = chosen.quote;
+            chosen.pool = selectedAuthor.pool;
+            chosen.poolPath = selectedAuthor.path;
         }
-        const selectedAuthor = weightedChoice(candidates);
-        if (!selectedAuthor)
-            throw new Error('Wikiquote Fetcher did not return a usable quote');
 
-        const index = Math.floor(Math.random() * selectedAuthor.quotes.length);
-        chosen = {
-            quote: selectedAuthor.quotes[index],
-            author: selectedAuthor.name,
-        };
-        chosen.poolQuote = chosen.quote;
-        chosen.pool = selectedAuthor.pool;
-        chosen.poolPath = selectedAuthor.path;
+        if (!chosen)
+            throw new Error('No enabled quote fits the current display');
+        const language = String(settings.appearance?.language ?? 'ORIGINAL')
+            .trim().toUpperCase();
+        if (language !== 'ORIGINAL' && language !== 'AUTO')
+            chosen.quote = await this.translateQuote(chosen.quote, language);
+        if (chosen.pool) {
+            chosen.pool.quotes = (chosen.pool.quotes ?? [])
+                .filter(quote => quote !== chosen.poolQuote);
+            writeText(chosen.poolPath, JSON.stringify(chosen.pool, null, 2));
+            delete chosen.pool;
+            delete chosen.poolPath;
+            delete chosen.poolQuote;
+        }
+        writeText(cachePath, `"${chosen.quote}" — ${chosen.author}`);
+        return chosen;
     }
-
-    if (!chosen)
-        throw new Error('No enabled quote fits the current display');
-    const language = String(settings.appearance?.language ?? 'ORIGINAL')
-        .trim().toUpperCase();
-    if (language !== 'ORIGINAL' && language !== 'AUTO')
-        chosen.quote = await runFetcher(['translate', language, chosen.quote]);
-    if (chosen.pool) {
-        chosen.pool.quotes = (chosen.pool.quotes ?? [])
-            .filter(quote => quote !== chosen.poolQuote);
-        writeText(chosen.poolPath, JSON.stringify(chosen.pool, null, 2));
-        delete chosen.pool;
-        delete chosen.poolPath;
-        delete chosen.poolQuote;
-    }
-    writeText(cachePath, `"${chosen.quote}" — ${chosen.author}`);
-    return chosen;
 }

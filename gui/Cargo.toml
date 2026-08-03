@@ -16,6 +16,6 @@ anyhow = "1.0"
 sha1 = "0.10"
 muote-core = { path = "../core" }
 position-containers = { path = "../position-containers" }
-wikiquote-fetcher = { path = "../../wikiquote-fetcher" }
+wikiquote-fetcher = "1.0.2"
 simplelog = "0.12.2"
 log = "0.4.29"

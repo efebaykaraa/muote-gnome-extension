@@ -5,9 +5,8 @@ import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
-import {skipQuote} from './quote.js';
+import {QuoteService} from './quote.js';
 
-const SETTINGS_SCHEMA = 'org.gnome.shell.extensions.muote';
 const LANGUAGES = [
     ['ORIGINAL', 'Original'],
     ['TR', 'Turkish'],
@@ -58,9 +57,9 @@ const DEFAULT_APPEARANCE = {
 
 const DEFAULT_AUTHORS = {
     authors: [
-        {name: 'Karl Marx', weight: 3},
-        {name: 'Friedrich Engels', weight: 2},
-        {name: 'Vladimir Lenin', weight: 2},
+        {name: 'Oscar Wilde', weight: 3},
+        {name: 'Marcus Aurelius', weight: 2},
+        {name: 'Confucius', weight: 2},
     ],
     show_weight_note: true,
     quote_mode: 'fetch',
@@ -296,7 +295,7 @@ function addAlignmentRow(group, title, appearance, horizontalKey, verticalKey, s
 }
 
 function createSettingsPage(
-    path, settings, authorsPath, authorsConfig, shortcutSettings, window) {
+    path, settings, authorsPath, authorsConfig, shortcutSettings, quoteService, window) {
     const appearance = settings.appearance;
     const save = () => saveSettings(path, settings, window);
     const page = new Adw.PreferencesPage({
@@ -348,7 +347,7 @@ function createSettingsPage(
         ([code]) => code === String(appearance.language).toUpperCase()));
     const languageRow = new Adw.ComboRow({
         title: 'Translation',
-        subtitle: 'Translate newly selected quotes with Wikiquote Fetcher',
+        subtitle: 'Translate newly selected quotes with Google Translate',
         model: Gtk.StringList.new(LANGUAGES.map(([, label]) => label)),
         selected: languageIndex,
     });
@@ -357,12 +356,6 @@ function createSettingsPage(
         save();
     });
     source.add(languageRow);
-    if (!GLib.find_program_in_path('wikiquote-fetcher')) {
-        source.add(new Adw.ActionRow({
-            title: 'Wikiquote Fetcher is not installed',
-            subtitle: 'Install it with: yay -S wikiquote-fetcher',
-        }));
-    }
     page.add(source);
 
     const actions = new Adw.PreferencesGroup({title: 'Quote actions'});
@@ -378,7 +371,7 @@ function createSettingsPage(
         skipButton.sensitive = false;
         skipButton.label = 'Loading…';
         try {
-            const quote = await skipQuote();
+            const quote = await quoteService.skipQuote();
             window.add_toast(new Adw.Toast({title: `Showing a quote by ${quote.author}`}));
         } catch (error) {
             window.add_toast(new Adw.Toast({title: error.message}));
@@ -683,9 +676,15 @@ export default class MuotePreferences extends ExtensionPreferences {
         ]);
         const settings = loadSettings(settingsPath);
         const authorsConfig = loadAuthors(authorsPath);
-        const shortcutSettings = this.getSettings(SETTINGS_SCHEMA);
+        const shortcutSettings = this.getSettings();
+        const quoteService = new QuoteService();
+        window.connect('close-request', () => {
+            quoteService.destroy();
+            return false;
+        });
         const settingsPage = createSettingsPage(
-            settingsPath, settings, authorsPath, authorsConfig, shortcutSettings, window);
+            settingsPath, settings, authorsPath, authorsConfig, shortcutSettings,
+            quoteService, window);
         const authorsPage = createAuthorsPage(authorsPath, authorsConfig, window);
         const customQuotesPage = createCustomQuotesPage(customQuotesPath, window);
         window.add(settingsPage);

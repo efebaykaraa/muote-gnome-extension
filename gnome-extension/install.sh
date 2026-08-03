@@ -10,6 +10,7 @@ install -m 0644 "$source_dir/metadata.json" "$extension_dir/metadata.json"
 install -m 0644 "$source_dir/extension.js" "$extension_dir/extension.js"
 install -m 0644 "$source_dir/prefs.js" "$extension_dir/prefs.js"
 install -m 0644 "$source_dir/quote.js" "$extension_dir/quote.js"
+rm -f "$extension_dir/install-wikiquote-fetcher.sh"
 install -m 0644 "$source_dir/stylesheet.css" "$extension_dir/stylesheet.css"
 install -Dm644 "$source_dir/schemas/org.gnome.shell.extensions.muote.gschema.xml" \
     "$extension_dir/schemas/org.gnome.shell.extensions.muote.gschema.xml"

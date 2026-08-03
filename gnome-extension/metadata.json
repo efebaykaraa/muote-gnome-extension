@@ -1,9 +1,8 @@
 {
   "uuid": "muote@efebaykaraa.github.com",
   "name": "Muote",
-  "description": "Display a configurable quote on the GNOME desktop.",
-  "shell-version": ["45", "46", "47", "48", "49", "50"],
-  "url": "https://github.com/efebaykaraa/muote",
-  "settings-schema": "org.gnome.shell.extensions.muote",
-  "version": 6
+  "description": "Display configurable Wikiquote or custom quotes on the GNOME desktop. Optional translation sends quote text to Google Translate.",
+  "shell-version": ["50"],
+  "url": "https://github.com/efebaykaraa/muote-gnome-extension",
+  "settings-schema": "org.gnome.shell.extensions.muote"
 }

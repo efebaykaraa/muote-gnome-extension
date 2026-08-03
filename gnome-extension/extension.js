@@ -10,10 +10,9 @@ import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import {skipQuote} from './quote.js';
+import {QuoteService} from './quote.js';
 
 const AUTHOR_WIDTH = 360;
-const SETTINGS_SCHEMA = 'org.gnome.shell.extensions.muote';
 
 const DEFAULT_APPEARANCE = {
     font: 'Inter',
@@ -324,7 +323,7 @@ function createTextBox({
 
 export default class MuoteExtension extends Extension {
     enable() {
-        console.log('Muote Cairo renderer revision 6 loaded');
+        this._quoteService = new QuoteService();
         this._settingsPath = GLib.build_filenamev([
             GLib.get_user_config_dir(), 'muote', 'settings.json',
         ]);
@@ -337,16 +336,18 @@ export default class MuoteExtension extends Extension {
             y_expand: true,
         });
 
-        // GNOME's background group is below normal windows and above the wallpaper.
-        // Adding the quote here gives it native Wayland desktop-layer behaviour.
-        Main.layoutManager._backgroundGroup.add_child(this._container);
+        // GNOME keeps the wallpaper as the bottom child of the window group.
+        // Place Muote directly above it, while leaving application windows above Muote.
+        const background = global.window_group.get_first_child();
+        global.window_group.add_child(this._container);
+        global.window_group.set_child_above_sibling(this._container, background);
 
         this._monitors = [];
         this._watchDirectory(GLib.path_get_dirname(this._settingsPath), 'settings.json');
         this._watchDirectory(GLib.path_get_dirname(this._quotePath), 'current_quote.txt');
         this._monitorsChangedId = Main.layoutManager.connect(
             'monitors-changed', () => this._queueReload());
-        this._shortcutSettings = this.getSettings(SETTINGS_SCHEMA);
+        this._shortcutSettings = this.getSettings();
         this._shortcutChangedId = this._shortcutSettings.connect(
             'changed::skip-quote-shortcut', () => this._registerSkipShortcut());
         this._registerSkipShortcut();
@@ -375,6 +376,8 @@ export default class MuoteExtension extends Extension {
             monitor.cancel();
         }
         this._monitors = [];
+        this._quoteService?.destroy();
+        this._quoteService = null;
         this._container?.destroy();
         this._container = null;
     }
@@ -391,11 +394,13 @@ export default class MuoteExtension extends Extension {
             async () => {
                 if (this._skipping)
                     return;
+                const quoteService = this._quoteService;
                 this._skipping = true;
                 try {
-                    await skipQuote();
+                    await quoteService.skipQuote();
                 } catch (error) {
-                    Main.notify('Muote', error.message);
+                    if (this._quoteService === quoteService)
+                        Main.notify('Muote', error.message);
                 } finally {
                     this._skipping = false;
                 }
@@ -418,7 +423,6 @@ export default class MuoteExtension extends Extension {
             const signalId = monitor.connect('changed', (_monitor, file, otherFile) => {
                 if (file?.get_basename() === basename ||
                     otherFile?.get_basename() === basename) {
-                    console.log(`Muote noticed a change to ${basename}`);
                     this._queueReload();
                 }
             });
@@ -591,7 +595,6 @@ export default class MuoteExtension extends Extension {
         if (this._editLayer)
             return;
 
-        console.log('Muote entered desktop positioning mode');
         this._container.hide();
         this._editAppearance = appearance;
         this._editLayer = new St.Widget({
