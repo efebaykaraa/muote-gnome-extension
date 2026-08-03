@@ -1,0 +1,8 @@
+[Unit]
+Description=Fetch daily quote from WikiQuote
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/muote-fetch

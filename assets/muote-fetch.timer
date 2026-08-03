@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily quote fetcher timer
+
+[Timer]
+OnBootSec=1m
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

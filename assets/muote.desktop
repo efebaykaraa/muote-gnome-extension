@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Muote
+Comment=Configure the desktop quote overlay
+Exec=muote-gui
+Icon=muote
+Terminal=false
+Categories=GTK;Utility;Settings;
+StartupNotify=true
