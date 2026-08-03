@@ -368,10 +368,10 @@ export default class MuoteExtension extends Extension {
             y_expand: true,
         });
 
-        // Keep a stable reference to GNOME's background group so Muote can be
-        // explicitly lowered again after the interactive positioning overlay closes.
-        this._backgroundActor = global.window_group.get_first_child();
-        global.window_group.add_child(this._container);
+        // Keep Muote inside GNOME's background group. If it is a sibling of
+        // window actors, newly-created popup windows can briefly be stacked
+        // below it before Mutter emits "restacked".
+        this._backgroundGroup = global.window_group.get_first_child();
         this._placeBelowWindows();
 
         this._monitors = [];
@@ -421,7 +421,7 @@ export default class MuoteExtension extends Extension {
         this._quoteService = null;
         this._container?.destroy();
         this._container = null;
-        this._backgroundActor = null;
+        this._backgroundGroup = null;
         this._previewOnTop = false;
     }
 
@@ -468,21 +468,16 @@ export default class MuoteExtension extends Extension {
         if (!this._container)
             return;
 
-        const parent = this._container.get_parent();
-        if (parent !== global.window_group) {
-            parent?.remove_child(this._container);
-            global.window_group.add_child(this._container);
-        }
+        const backgroundGroup = this._backgroundGroup;
+        if (!backgroundGroup)
+            return;
 
-        let background = this._backgroundActor?.get_parent() === global.window_group
-            ? this._backgroundActor
-            : global.window_group.get_first_child();
-        if (background === this._container)
-            background = this._container.get_next_sibling();
-        if (background)
-            global.window_group.set_child_above_sibling(this._container, background);
-        else
-            global.window_group.set_child_below_sibling(this._container, null);
+        const parent = this._container.get_parent();
+        if (parent !== backgroundGroup) {
+            parent?.remove_child(this._container);
+            backgroundGroup.add_child(this._container);
+        }
+        backgroundGroup.set_child_above_sibling(this._container, null);
     }
 
     _placeAboveWindows() {
