@@ -10,5 +10,5 @@ gnome-extensions pack --force \
     --out-dir="$output_dir" \
     --extra-source=quote.js \
     --extra-source=../LICENSE \
+    --schema=schemas/org.gnome.shell.extensions.muote.gschema.xml \
     "$source_dir"
-

@@ -39,35 +39,64 @@ const DEFAULT_APPEARANCE = {
     author_y: 966,
     quote_max_width: 1499,
     quote_max_height: 315,
+    preview_on_top: false,
     positioning_enabled: false,
 };
 
-function readTextFile(path) {
-    try {
-        const [ok, contents] = Gio.File.new_for_path(path).load_contents(null);
-        return ok ? new TextDecoder().decode(contents) : '';
-    } catch (error) {
-        if (!error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
-            console.error(`Muote could not read ${path}: ${error.message}`);
-        return '';
-    }
+function logError(message, error) {
+    console.error(`Muote ${message}: ${error.message}`);
 }
 
-function loadAppearance(path) {
-    const raw = readTextFile(path).replace(/^hash:.*$/m, '').trim();
+function readTextFile(path, cancellable = null) {
+    const file = Gio.File.new_for_path(path);
+    return new Promise(resolve => {
+        file.load_contents_async(cancellable, (source, result) => {
+            try {
+                const [ok, contents] = source.load_contents_finish(result);
+                resolve(ok ? new TextDecoder().decode(contents) : '');
+            } catch (error) {
+                if (!error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND) &&
+                    !error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    logError(`could not read ${path}`, error);
+                resolve('');
+            }
+        });
+    });
+}
+
+function writeTextFile(path, contents) {
+    const file = Gio.File.new_for_path(path);
+    const bytes = new TextEncoder().encode(contents);
+    return new Promise((resolve, reject) => {
+        file.replace_contents_async(
+            bytes, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null,
+            (source, result) => {
+                try {
+                    source.replace_contents_finish(result);
+                    resolve();
+                } catch (error) {
+                    reject(error);
+                }
+            });
+    });
+}
+
+async function loadAppearance(path, cancellable) {
+    const raw = (await readTextFile(path, cancellable))
+        .replace(/^hash:.*$/m, '').trim();
     if (!raw)
         return {...DEFAULT_APPEARANCE};
 
     try {
         return {...DEFAULT_APPEARANCE, ...JSON.parse(raw).appearance};
     } catch (error) {
-        console.error(`Muote settings are invalid: ${error.message}`);
+        logError('settings are invalid', error);
         return {...DEFAULT_APPEARANCE};
     }
 }
 
-function loadQuote(path) {
-    const raw = readTextFile(path).trim();
+async function loadQuote(path, cancellable) {
+    const raw = (await readTextFile(path, cancellable)).trim();
     const separator = raw.lastIndexOf(' — ');
     if (separator < 0)
         return {text: raw, author: ''};
@@ -324,6 +353,9 @@ function createTextBox({
 export default class MuoteExtension extends Extension {
     enable() {
         this._quoteService = new QuoteService();
+        this._fileCancellable = new Gio.Cancellable();
+        this._reloadSerial = 0;
+        this._previewOnTop = false;
         this._settingsPath = GLib.build_filenamev([
             GLib.get_user_config_dir(), 'muote', 'settings.json',
         ]);
@@ -336,17 +368,20 @@ export default class MuoteExtension extends Extension {
             y_expand: true,
         });
 
-        // GNOME keeps the wallpaper as the bottom child of the window group.
-        // Place Muote directly above it, while leaving application windows above Muote.
-        const background = global.window_group.get_first_child();
+        // Keep a stable reference to GNOME's background group so Muote can be
+        // explicitly lowered again after the interactive positioning overlay closes.
+        this._backgroundActor = global.window_group.get_first_child();
         global.window_group.add_child(this._container);
-        global.window_group.set_child_above_sibling(this._container, background);
+        this._placeBelowWindows();
 
         this._monitors = [];
+        this._reloadSerial++;
         this._watchDirectory(GLib.path_get_dirname(this._settingsPath), 'settings.json');
         this._watchDirectory(GLib.path_get_dirname(this._quotePath), 'current_quote.txt');
         this._monitorsChangedId = Main.layoutManager.connect(
             'monitors-changed', () => this._queueReload());
+        this._restackedId = global.display.connect(
+            'restacked', () => this._syncLayerOrder());
         this._shortcutSettings = this.getSettings();
         this._shortcutChangedId = this._shortcutSettings.connect(
             'changed::skip-quote-shortcut', () => this._registerSkipShortcut());
@@ -371,15 +406,23 @@ export default class MuoteExtension extends Extension {
             Main.layoutManager.disconnect(this._monitorsChangedId);
             this._monitorsChangedId = 0;
         }
+        if (this._restackedId) {
+            global.display.disconnect(this._restackedId);
+            this._restackedId = 0;
+        }
         for (const [monitor, signalId] of this._monitors) {
             monitor.disconnect(signalId);
             monitor.cancel();
         }
         this._monitors = [];
+        this._fileCancellable?.cancel();
+        this._fileCancellable = null;
         this._quoteService?.destroy();
         this._quoteService = null;
         this._container?.destroy();
         this._container = null;
+        this._backgroundActor = null;
+        this._previewOnTop = false;
     }
 
     _registerSkipShortcut() {
@@ -390,8 +433,10 @@ export default class MuoteExtension extends Extension {
             'skip-quote-shortcut',
             this._shortcutSettings,
             Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+            Shell.ActionMode.NORMAL,
             async () => {
+                if (this._applicationWindowHasFocus())
+                    return;
                 if (this._skipping)
                     return;
                 const quoteService = this._quoteService;
@@ -407,13 +452,65 @@ export default class MuoteExtension extends Extension {
             });
     }
 
+    _applicationWindowHasFocus() {
+        const window = global.display.focus_window;
+        if (!window || window.get_window_type() === Meta.WindowType.DESKTOP)
+            return false;
+
+        // Mutter can briefly retain the last window as focus_window after it
+        // was minimized or Shell took focus. Only block the shortcut when the
+        // window still owns keyboard focus and is visible on its workspace.
+        return window.has_focus() && !window.minimized &&
+            window.showing_on_its_workspace();
+    }
+
+    _placeBelowWindows() {
+        if (!this._container)
+            return;
+
+        const parent = this._container.get_parent();
+        if (parent !== global.window_group) {
+            parent?.remove_child(this._container);
+            global.window_group.add_child(this._container);
+        }
+
+        let background = this._backgroundActor?.get_parent() === global.window_group
+            ? this._backgroundActor
+            : global.window_group.get_first_child();
+        if (background === this._container)
+            background = this._container.get_next_sibling();
+        if (background)
+            global.window_group.set_child_above_sibling(this._container, background);
+        else
+            global.window_group.set_child_below_sibling(this._container, null);
+    }
+
+    _placeAboveWindows() {
+        if (!this._container)
+            return;
+
+        const parent = this._container.get_parent();
+        if (parent !== global.window_group) {
+            parent?.remove_child(this._container);
+            global.window_group.add_child(this._container);
+        }
+        global.window_group.set_child_above_sibling(this._container, null);
+    }
+
+    _syncLayerOrder() {
+        if (this._previewOnTop)
+            this._placeAboveWindows();
+        else
+            this._placeBelowWindows();
+    }
+
     _watchDirectory(path, basename) {
         const directory = Gio.File.new_for_path(path);
         try {
             directory.make_directory_with_parents(null);
         } catch (error) {
             if (!error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.EXISTS)) {
-                console.error(`Muote could not create ${path}: ${error.message}`);
+                logError(`could not create ${path}`, error);
                 return;
             }
         }
@@ -428,7 +525,7 @@ export default class MuoteExtension extends Extension {
             });
             this._monitors.push([monitor, signalId]);
         } catch (error) {
-            console.error(`Muote could not monitor ${path}: ${error.message}`);
+            logError(`could not monitor ${path}`, error);
         }
     }
 
@@ -442,18 +539,27 @@ export default class MuoteExtension extends Extension {
         });
     }
 
-    _reload() {
+    async _reload() {
         if (!this._container)
             return;
 
-        const appearance = loadAppearance(this._settingsPath);
-        const quote = loadQuote(this._quotePath);
+        const serial = ++this._reloadSerial;
+        const cancellable = this._fileCancellable;
+        const [appearance, quote] = await Promise.all([
+            loadAppearance(this._settingsPath, cancellable),
+            loadQuote(this._quotePath, cancellable),
+        ]);
+        if (!this._container || cancellable?.is_cancelled() ||
+            serial !== this._reloadSerial)
+            return;
+        this._previewOnTop = appearance.preview_on_top === true;
         if (appearance.positioning_enabled) {
             this._enterPositioning(appearance, quote);
             return;
         }
 
         this._exitPositioning();
+        this._syncLayerOrder();
         this._container.destroy_all_children();
         this._container.set_size(global.stage.width, global.stage.height);
         if (!quote.text)
@@ -495,7 +601,7 @@ export default class MuoteExtension extends Extension {
     }
 
     _makeDraggable(actor) {
-        actor.connect('button-press-event', (_actor, event) => {
+        const pressId = actor.connect('button-press-event', (_actor, event) => {
             if (event.get_button() !== 1)
                 return Clutter.EVENT_PROPAGATE;
 
@@ -514,7 +620,7 @@ export default class MuoteExtension extends Extension {
             this._guides?.queue_repaint();
             return Clutter.EVENT_STOP;
         });
-        actor.connect('motion-event', (_actor, event) => {
+        const motionId = actor.connect('motion-event', (_actor, event) => {
             if (this._drag?.actor !== actor)
                 return Clutter.EVENT_PROPAGATE;
 
@@ -578,7 +684,7 @@ export default class MuoteExtension extends Extension {
             this._guides?.queue_repaint();
             return Clutter.EVENT_STOP;
         });
-        actor.connect('button-release-event', (_actor, event) => {
+        const releaseId = actor.connect('button-release-event', (_actor, event) => {
             if (event.get_button() !== 1 || this._drag?.actor !== actor)
                 return Clutter.EVENT_PROPAGATE;
 
@@ -589,6 +695,7 @@ export default class MuoteExtension extends Extension {
             this._guides?.hide();
             return Clutter.EVENT_STOP;
         });
+        this._positionSignals.push([actor, pressId, motionId, releaseId]);
     }
 
     _enterPositioning(appearance, quote) {
@@ -596,6 +703,7 @@ export default class MuoteExtension extends Extension {
             return;
 
         this._container.hide();
+        this._positionSignals = [];
         this._editAppearance = appearance;
         this._editLayer = new St.Widget({
             reactive: false,
@@ -617,7 +725,7 @@ export default class MuoteExtension extends Extension {
             height: global.stage.height,
             visible: false,
         });
-        this._guides.connect('repaint', area => {
+        this._guidesRepaintId = this._guides.connect('repaint', area => {
             const cr = area.get_context();
             const mx = monitor.x;
             const my = monitor.y;
@@ -719,14 +827,15 @@ export default class MuoteExtension extends Extension {
         this._editLayer.add_child(toolbar);
     }
 
-    _writeAppearance(updates) {
-        const raw = readTextFile(this._settingsPath).replace(/^hash:.*$/m, '').trim();
+    async _writeAppearance(updates) {
+        const raw = (await readTextFile(this._settingsPath))
+            .replace(/^hash:.*$/m, '').trim();
         let settings = {appearance: {...DEFAULT_APPEARANCE}};
         if (raw) {
             try {
                 settings = JSON.parse(raw);
             } catch (error) {
-                console.error(`Muote settings are invalid: ${error.message}`);
+                logError('settings are invalid', error);
             }
         }
         settings.appearance = {
@@ -738,13 +847,13 @@ export default class MuoteExtension extends Extension {
 
         try {
             GLib.mkdir_with_parents(GLib.path_get_dirname(this._settingsPath), 0o700);
-            GLib.file_set_contents(this._settingsPath, JSON.stringify(settings, null, 2));
+            await writeTextFile(this._settingsPath, JSON.stringify(settings, null, 2));
         } catch (error) {
-            console.error(`Muote could not save positions: ${error.message}`);
+            logError('could not save positions', error);
         }
     }
 
-    _finishPositioning(save) {
+    async _finishPositioning(save) {
         const updates = {};
         if (save && this._editQuote && this._editAuthor) {
             const monitor = Main.layoutManager.primaryMonitor ??
@@ -758,7 +867,7 @@ export default class MuoteExtension extends Extension {
             updates.author_y = Math.round(this._editAuthor.y +
                 this._editAuthor._muoteInset - monitor.y);
         }
-        this._writeAppearance(updates);
+        await this._writeAppearance(updates);
         this._exitPositioning();
         this._reload();
     }
@@ -767,13 +876,23 @@ export default class MuoteExtension extends Extension {
         this._drag = null;
         this._dragGrab?.dismiss();
         this._dragGrab = null;
+        for (const [actor, ...signalIds] of this._positionSignals ?? []) {
+            for (const signalId of signalIds)
+                actor.disconnect(signalId);
+        }
+        this._positionSignals = null;
+        if (this._guides && this._guidesRepaintId)
+            this._guides.disconnect(this._guidesRepaintId);
+        this._guidesRepaintId = 0;
+        this._guides?.destroy();
+        this._guides = null;
         this._editLayer?.destroy();
         this._editLayer = null;
         this._editQuote = null;
         this._editAuthor = null;
-        this._guides = null;
         this._pairGuides = null;
         this._editAppearance = null;
+        this._syncLayerOrder();
         this._container?.show();
     }
 }

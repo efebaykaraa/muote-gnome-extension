@@ -52,6 +52,7 @@ const DEFAULT_APPEARANCE = {
     quote_max_height: 315,
     max_quote_chars: 581,
     position_hash: '',
+    preview_on_top: false,
     positioning_enabled: false,
 };
 
@@ -108,6 +109,26 @@ function saveSettings(path, settings, window) {
         console.error(`Muote could not save settings: ${error.message}`);
         window.add_toast(new Adw.Toast({title: `Could not save settings: ${error.message}`}));
     }
+}
+
+function setPreviewOnTop(path, enabled, window) {
+    const settings = loadSettings(path);
+    if (settings.appearance.preview_on_top === enabled)
+        return;
+
+    settings.appearance.preview_on_top = enabled;
+    saveSettings(path, settings, window);
+}
+
+function stopInteractiveState(path, window) {
+    const settings = loadSettings(path);
+    if (!settings.appearance.positioning_enabled &&
+        !settings.appearance.preview_on_top)
+        return;
+
+    settings.appearance.positioning_enabled = false;
+    settings.appearance.preview_on_top = false;
+    saveSettings(path, settings, window);
 }
 
 function loadAuthors(path) {
@@ -678,10 +699,27 @@ export default class MuotePreferences extends ExtensionPreferences {
         const authorsConfig = loadAuthors(authorsPath);
         const shortcutSettings = this.getSettings();
         const quoteService = new QuoteService();
-        window.connect('close-request', () => {
+        let cleanedUp = false;
+        const cleanup = () => {
+            if (cleanedUp)
+                return;
+            cleanedUp = true;
+            stopInteractiveState(settingsPath, window);
             quoteService.destroy();
+        };
+        window.connect('close-request', () => {
+            cleanup();
             return false;
         });
+        window.connect('notify::visible', source => {
+            if (!source.visible)
+                cleanup();
+        });
+        window.connect('notify::is-active', source => {
+            if (!cleanedUp)
+                setPreviewOnTop(settingsPath, source.is_active, window);
+        });
+        setPreviewOnTop(settingsPath, window.is_active, window);
         const settingsPage = createSettingsPage(
             settingsPath, settings, authorsPath, authorsConfig, shortcutSettings,
             quoteService, window);

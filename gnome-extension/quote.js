@@ -3,18 +3,23 @@ import GLib from 'gi://GLib';
 import Soup from 'gi://Soup?version=3.0';
 
 function readText(path) {
-    try {
-        const [ok, contents] = Gio.File.new_for_path(path).load_contents(null);
-        return ok ? new TextDecoder().decode(contents) : '';
-    } catch (error) {
-        if (!error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
-            console.error(`Muote could not read ${path}: ${error.message}`);
-        return '';
-    }
+    const file = Gio.File.new_for_path(path);
+    return new Promise(resolve => {
+        file.load_contents_async(null, (source, result) => {
+            try {
+                const [ok, contents] = source.load_contents_finish(result);
+                resolve(ok ? new TextDecoder().decode(contents) : '');
+            } catch (error) {
+                if (!error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+                    console.error(`Muote could not read ${path}: ${error.message}`);
+                resolve('');
+            }
+        });
+    });
 }
 
-function readJson(path, fallback) {
-    const raw = readText(path).replace(/^hash:.*$/m, '').trim();
+async function readJson(path, fallback) {
+    const raw = (await readText(path)).replace(/^hash:.*$/m, '').trim();
     if (!raw)
         return fallback;
     try {
@@ -27,7 +32,20 @@ function readJson(path, fallback) {
 
 function writeText(path, contents) {
     GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o700);
-    GLib.file_set_contents(path, contents);
+    const file = Gio.File.new_for_path(path);
+    const bytes = new TextEncoder().encode(contents);
+    return new Promise((resolve, reject) => {
+        file.replace_contents_async(
+            bytes, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null,
+            (source, result) => {
+                try {
+                    source.replace_contents_finish(result);
+                    resolve();
+                } catch (error) {
+                    reject(error);
+                }
+            });
+    });
 }
 
 function weightedChoice(items) {
@@ -53,9 +71,9 @@ function parseCurrent(raw) {
     };
 }
 
-function parseCustomQuotes(path) {
+function parseCustomQuotes(contents) {
     const quotes = [];
-    for (const rawLine of readText(path).split(/\r?\n/)) {
+    for (const rawLine of contents.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line || line.startsWith('#'))
             continue;
@@ -127,10 +145,10 @@ function extractQuotesFromHtml(html) {
     return [...new Set(quotes)];
 }
 
-function fetchCandidates(enabledAuthors, configDir, current, maxChars) {
-    return enabledAuthors.map(author => {
+async function fetchCandidates(enabledAuthors, configDir, current, maxChars) {
+    const candidates = await Promise.all(enabledAuthors.map(async author => {
         const path = poolPath(configDir, author.name);
-        const pool = readJson(path, {key: author.name, quotes: []});
+        const pool = await readJson(path, {key: author.name, quotes: []});
         let quotes = (pool.quotes ?? []).filter(quote =>
             typeof quote === 'string' && [...quote].length <= maxChars);
         const alternatives = quotes.filter(quote =>
@@ -138,7 +156,8 @@ function fetchCandidates(enabledAuthors, configDir, current, maxChars) {
         if (alternatives.length)
             quotes = alternatives;
         return {...author, path, pool, quotes};
-    }).filter(author => author.quotes.length);
+    }));
+    return candidates.filter(author => author.quotes.length);
 }
 
 export class QuoteService {
@@ -212,21 +231,23 @@ export class QuoteService {
         const cachePath = GLib.build_filenamev([
             GLib.get_user_cache_dir(), 'muote', 'current_quote.txt',
         ]);
-        const authors = readJson(GLib.build_filenamev([configDir, 'authors.json']), {
+        const authors = await readJson(
+            GLib.build_filenamev([configDir, 'authors.json']), {
             authors: [],
             quote_mode: 'fetch',
         });
-        const settings = readJson(GLib.build_filenamev([configDir, 'settings.json']), {
+        const settings = await readJson(
+            GLib.build_filenamev([configDir, 'settings.json']), {
             appearance: {max_quote_chars: 581},
         });
         const maxChars = Math.max(
             1, Number(settings.appearance?.max_quote_chars) || 581);
-        const current = parseCurrent(readText(cachePath));
+        const current = parseCurrent(await readText(cachePath));
 
         let chosen = null;
         if (authors.quote_mode === 'custom') {
-            let quotes = parseCustomQuotes(
-                GLib.build_filenamev([configDir, 'custom-quotes.muote']))
+            let quotes = parseCustomQuotes(await readText(
+                GLib.build_filenamev([configDir, 'custom-quotes.muote'])))
                 .filter(quote => quote.weight > 0 &&
                     [...quote.quote].length <= maxChars);
             const alternatives = quotes.filter(quote =>
@@ -239,16 +260,16 @@ export class QuoteService {
                 String(author.name ?? '').trim() && Number(author.weight) > 0);
             if (!enabledAuthors.length)
                 throw new Error('No enabled authors are configured');
-            let candidates = fetchCandidates(
+            let candidates = await fetchCandidates(
                 enabledAuthors, configDir, current, maxChars);
             if (!candidates.length) {
                 const author = weightedChoice(enabledAuthors);
                 const quotes = await this.fetchWikiquote(author.name);
-                writeText(poolPath(configDir, author.name), JSON.stringify({
+                await writeText(poolPath(configDir, author.name), JSON.stringify({
                     key: author.name,
                     quotes,
                 }, null, 2));
-                candidates = fetchCandidates(
+                candidates = await fetchCandidates(
                     enabledAuthors, configDir, current, maxChars);
             }
             const selectedAuthor = weightedChoice(candidates);
@@ -274,12 +295,12 @@ export class QuoteService {
         if (chosen.pool) {
             chosen.pool.quotes = (chosen.pool.quotes ?? [])
                 .filter(quote => quote !== chosen.poolQuote);
-            writeText(chosen.poolPath, JSON.stringify(chosen.pool, null, 2));
+            await writeText(chosen.poolPath, JSON.stringify(chosen.pool, null, 2));
             delete chosen.pool;
             delete chosen.poolPath;
             delete chosen.poolQuote;
         }
-        writeText(cachePath, `"${chosen.quote}" — ${chosen.author}`);
+        await writeText(cachePath, `"${chosen.quote}" — ${chosen.author}`);
         return chosen;
     }
 }
