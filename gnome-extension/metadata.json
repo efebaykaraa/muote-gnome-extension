@@ -1,8 +1,9 @@
 {
   "uuid": "muote@efebaykaraa.github.com",
   "name": "Muote",
-  "description": "Display configurable Wikiquote or custom quotes on the GNOME desktop. Optional translation sends quote text to Google Translate.",
+  "description": "Display quotes from your favorite authors on your desktop. It comes with a simple settings menu and a lot of configuration options to mess with.",
   "shell-version": ["50"],
   "url": "https://github.com/efebaykaraa/muote-gnome-extension",
-  "settings-schema": "org.gnome.shell.extensions.muote"
+  "settings-schema": "org.gnome.shell.extensions.muote",
+  "version": 8
 }
